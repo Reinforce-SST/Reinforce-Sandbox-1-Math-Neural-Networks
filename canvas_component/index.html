@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  * {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+  body {
+    background-color: transparent;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: flex-start;
+    padding: 4px;
+    overflow: hidden;
+  }
+  .canvas-wrapper {
+    position: relative;
+    border: 2px solid #334155;
+    border-radius: 10px;
+    background: #000000;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.6);
+    cursor: crosshair;
+  }
+  #paintCanvas {
+    display: block;
+    border-radius: 8px;
+    touch-action: none;
+  }
+  .controls {
+    display: flex;
+    gap: 10px;
+    margin-top: 12px;
+    width: 280px;
+    justify-content: space-between;
+  }
+  .btn {
+    flex: 1;
+    background-color: #ef4444;
+    color: white;
+    border: none;
+    padding: 8px 14px;
+    font-size: 13px;
+    font-weight: 600;
+    border-radius: 6px;
+    cursor: pointer;
+    transition: background-color 0.15s ease, transform 0.05s ease;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+  }
+  .btn:hover {
+    background-color: #dc2626;
+  }
+  .btn:active {
+    transform: scale(0.98);
+  }
+</style>
+</head>
+<body>
+  <div class="canvas-wrapper">
+    <canvas id="paintCanvas" width="280" height="280"></canvas>
+  </div>
+  <div class="controls">
+    <button id="clearBtn" class="btn">🗑️ Clear Canvas</button>
+  </div>
+
+  <script>
+    // Streamlit Component Protocol implementation
+    function sendMessage(type, data) {
+      window.parent.postMessage(
+        Object.assign({ isStreamlitMessage: true, type: type }, data),
+        "*"
+      );
+    }
+
+    function setComponentReady() {
+      sendMessage("streamlit:componentReady", { apiVersion: 1 });
+    }
+
+    function setFrameHeight(height) {
+      sendMessage("streamlit:setFrameHeight", { height: height || 345 });
+    }
+
+    function setComponentValue(value) {
+      sendMessage("streamlit:setComponentValue", { value: value });
+    }
+
+    const canvas = document.getElementById("paintCanvas");
+    const ctx = canvas.getContext("2d", { willReadFrequently: true });
+    const clearBtn = document.getElementById("clearBtn");
+
+    let isDrawing = false;
+    let strokeWidth = 20;
+    let lastX = 0;
+    let lastY = 0;
+
+    function resetCanvas() {
+      ctx.fillStyle = "#000000";
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.lineWidth = strokeWidth;
+      ctx.lineCap = "round";
+      ctx.lineJoin = "round";
+      ctx.strokeStyle = "#FFFFFF";
+    }
+
+    resetCanvas();
+
+    function getPos(e) {
+      const rect = canvas.getBoundingClientRect();
+      const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+      const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+      return {
+        x: clientX - rect.left,
+        y: clientY - rect.top
+      };
+    }
+
+    function startDrawing(e) {
+      isDrawing = true;
+      const pos = getPos(e);
+      lastX = pos.x;
+      lastY = pos.y;
+      
+      // Draw single dot if just clicking
+      ctx.beginPath();
+      ctx.arc(lastX, lastY, strokeWidth / 2, 0, Math.PI * 2);
+      ctx.fillStyle = "#FFFFFF";
+      ctx.fill();
+    }
+
+    function draw(e) {
+      if (!isDrawing) return;
+      e.preventDefault();
+      const pos = getPos(e);
+
+      ctx.beginPath();
+      ctx.moveTo(lastX, lastY);
+      ctx.lineTo(pos.x, pos.y);
+      ctx.stroke();
+
+      lastX = pos.x;
+      lastY = pos.y;
+    }
+
+    function stopDrawing() {
+      if (!isDrawing) return;
+      isDrawing = false;
+      sendData();
+    }
+
+    function sendData() {
+      const dataUrl = canvas.toDataURL("image/png");
+      setComponentValue(dataUrl);
+    }
+
+    canvas.addEventListener("mousedown", startDrawing);
+    canvas.addEventListener("mousemove", draw);
+    window.addEventListener("mouseup", stopDrawing);
+
+    canvas.addEventListener("touchstart", startDrawing, { passive: false });
+    canvas.addEventListener("touchmove", draw, { passive: false });
+    window.addEventListener("touchend", stopDrawing);
+
+    clearBtn.addEventListener("click", () => {
+      resetCanvas();
+      setComponentValue(null);
+    });
+
+    window.addEventListener("message", (event) => {
+      if (event.data && event.data.type === "streamlit:render") {
+        if (event.data.args && event.data.args.stroke_width) {
+          strokeWidth = event.data.args.stroke_width;
+          ctx.lineWidth = strokeWidth;
+        }
+      }
+    });
+
+    // Notify Streamlit
+    setComponentReady();
+    setFrameHeight(345);
+  </script>
+</body>
+</html>

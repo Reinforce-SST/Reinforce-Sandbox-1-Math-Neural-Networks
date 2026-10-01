@@ -1,0 +1,12 @@
+[project]
+name = "sandbox-1-neural-network-math-it-out"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "numpy>=2.5.3",
+    "pillow>=12.3.0",
+    "streamlit>=1.64.0",
+    "streamlit-drawable-canvas>=0.13.0",
+]
