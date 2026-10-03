@@ -1,6 +1,4 @@
 import base64
-import importlib
-import inspect
 import io
 from pathlib import Path
 import sys
@@ -10,99 +8,328 @@ from PIL import Image
 import streamlit as st
 import streamlit.components.v1 as components
 
-# Page configuration
+# Ensure neural_network module and its internal dependencies are discoverable
+NEURAL_NET_DIR = Path(__file__).parent / "neural_network"
+if str(NEURAL_NET_DIR) not in sys.path:
+    sys.path.insert(0, str(NEURAL_NET_DIR))
+
+from activation import Activation
+from loss_function import LossFunction
+from optimizer import Optimizer
+from neural_network import NeuralNetwork
+from loader import load_mnist_images, load_mnist_labels
+
+# ---------------------------------------------------------
+# Page Configuration
+# ---------------------------------------------------------
 st.set_page_config(
-    page_title="28x28 Neural Network Visualizer",
+    page_title="Neural Network Sandbox: Training & Inference",
     page_icon="🧠",
     layout="wide",
 )
 
-st.title("🧠 28×28 Digit Canvas & Neural Network Visualizer")
+st.title("🧠 Neural Network Sandbox: Live Training & Canvas Inference")
 st.caption(
-    "Interactive teaching sandbox: Draw on the canvas, inspect the downscaled 28×28 "
-    "pixel grid, and feed it directly into `LinearNeuralNetwork.py`."
+    "Interactive deep learning playground connected directly to `neural_network/`. "
+    "Train your custom multi-layer perceptron on MNIST and test predictions live on the drawing canvas."
 )
 
 # Declare HTML5 Canvas Component
 CANVAS_DIR = Path(__file__).parent / "canvas_component"
 digit_canvas = components.declare_component("digit_canvas", path=str(CANVAS_DIR))
 
+
 # ---------------------------------------------------------
-# Sidebar Controls
+# MNIST Preprocessing & Centering (Center of Mass & Bounding Box)
+# ---------------------------------------------------------
+def preprocess_mnist_digit(pil_img, mode="mnist_center"):
+    """
+    Preprocesses canvas drawing to match standard MNIST distribution:
+    1. Identifies the bounding box of drawn pixels.
+    2. Scales the digit into a 20x20 pixel box (preserving aspect ratio).
+    3. Centers the digit in a 28x28 canvas using Center of Mass (same as MNIST).
+    """
+    arr = np.array(pil_img, dtype=np.float32)
+    if not np.any(arr > 20):
+        return np.zeros((28, 28), dtype=np.float32), False
+
+    if mode == "raw_rescale":
+        pil_28 = pil_img.resize((28, 28), Image.Resampling.BILINEAR)
+        img_28 = np.array(pil_28, dtype=np.float32) / 255.0
+        return img_28, True
+
+    # 1. Bounding box cropping
+    rows = np.any(arr > 20, axis=1)
+    cols = np.any(arr > 20, axis=0)
+    rmin, rmax = np.where(rows)[0][[0, -1]]
+    cmin, cmax = np.where(cols)[0][[0, -1]]
+
+    cropped = arr[rmin : rmax + 1, cmin : cmax + 1]
+    h, w = cropped.shape
+
+    # 2. Aspect-ratio preserving resize into 20x20
+    if h > w:
+        new_h = 20
+        new_w = max(1, int(round((w / h) * 20)))
+    else:
+        new_w = 20
+        new_h = max(1, int(round((h / w) * 20)))
+
+    cropped_pil = Image.fromarray(cropped.astype(np.uint8))
+    resized_pil = cropped_pil.resize((new_w, new_h), Image.Resampling.BILINEAR)
+    resized_arr = np.array(resized_pil, dtype=np.float32)
+
+    # 3. Paste into 28x28 black image canvas
+    padded = np.zeros((28, 28), dtype=np.float32)
+    pad_top = (28 - new_h) // 2
+    pad_left = (28 - new_w) // 2
+    padded[pad_top : pad_top + new_h, pad_left : pad_left + new_w] = resized_arr
+
+    # 4. Center of Mass Shift
+    total_mass = np.sum(padded)
+    if total_mass > 0:
+        cy, cx = np.meshgrid(np.arange(28), np.arange(28), indexing="ij")
+        center_y = np.sum(cy * padded) / total_mass
+        center_x = np.sum(cx * padded) / total_mass
+
+        shift_y = int(round(13.5 - center_y))
+        shift_x = int(round(13.5 - center_x))
+
+        # Apply integer translation
+        shifted = np.zeros_like(padded)
+        for y in range(28):
+            for x in range(28):
+                ny, nx = y + shift_y, x + shift_x
+                if 0 <= ny < 28 and 0 <= nx < 28:
+                    shifted[ny, nx] = padded[y, x]
+        padded = shifted
+
+    img_28 = np.clip(padded / 255.0, 0.0, 1.0)
+    return img_28, True
+
+
+# ---------------------------------------------------------
+# Cached Dataset Loader
+# ---------------------------------------------------------
+@st.cache_data(show_spinner=False)
+def load_dataset():
+    """Loads MNIST train and test sets from neural_network/dataset."""
+    dataset_dir = NEURAL_NET_DIR / "dataset"
+
+    # Path resolution supporting both directory nested or flat structures
+    train_img_path = dataset_dir / "train-images-idx3-ubyte" / "train-images-idx3-ubyte"
+    if not train_img_path.exists():
+        train_img_path = dataset_dir / "train-images.idx3-ubyte"
+
+    train_lbl_path = dataset_dir / "train-labels-idx1-ubyte" / "train-labels-idx1-ubyte"
+    if not train_lbl_path.exists():
+        train_lbl_path = dataset_dir / "train-labels.idx1-ubyte"
+
+    test_img_path = dataset_dir / "t10k-images-idx3-ubyte" / "t10k-images-idx3-ubyte"
+    if not test_img_path.exists():
+        test_img_path = dataset_dir / "t10k-images.idx3-ubyte"
+
+    test_lbl_path = dataset_dir / "t10k-labels-idx1-ubyte" / "t10k-labels-idx1-ubyte"
+    if not test_lbl_path.exists():
+        test_lbl_path = dataset_dir / "t10k-labels.idx1-ubyte"
+
+    x_train = load_mnist_images(str(train_img_path))
+    y_train_raw = load_mnist_labels(str(train_lbl_path))
+    y_train = np.eye(10)[y_train_raw]
+
+    x_test = load_mnist_images(str(test_img_path))
+    y_test_raw = load_mnist_labels(str(test_lbl_path))
+    y_test = np.eye(10)[y_test_raw]
+
+    return x_train, y_train, x_test, y_test
+
+
+# ---------------------------------------------------------
+# Session State Initialization
+# ---------------------------------------------------------
+def create_default_network(hidden_layers_spec=None):
+    if hidden_layers_spec is None:
+        hidden_layers_spec = [
+            (128, Activation.SIGMOID),
+            (32, Activation.SIGMOID),
+        ]
+    return NeuralNetwork(input_size=784, output_size=10, hidden_layers=hidden_layers_spec)
+
+
+if "model" not in st.session_state:
+    st.session_state.model = create_default_network()
+    st.session_state.is_trained = False
+    st.session_state.training_history = []
+    st.session_state.test_metrics = None
+
+
+# ---------------------------------------------------------
+# Sidebar: Training Controls & Canvas Settings
 # ---------------------------------------------------------
 with st.sidebar:
-    st.header("⚙️ Canvas Settings")
-    stroke_width = st.slider("Brush Width", min_value=12, max_value=32, value=20, step=2)
-    
-    st.divider()
-    st.header("📐 Input Format to `forward(x)`")
-    target_shape = st.selectbox(
-        "Vector shape passed to `forward(x)`",
-        options=["(1, 784) - Row vector", "(784, 1) - Column vector", "(28, 28) - 2D Matrix"],
+    st.header("⚙️ Model Training")
+
+    arch_choice = st.selectbox(
+        "Hidden Layers Architecture",
+        options=[
+            "128 -> 32 (Default)",
+            "128",
+            "256 -> 128",
+            "64 -> 32 -> 16",
+        ],
         index=0,
     )
-    
+
+    act_choice = st.selectbox(
+        "Activation Function",
+        options=["SIGMOID", "RELU", "TANH", "LINEAR"],
+        index=0,
+    )
+    act_enum = Activation[act_choice]
+
+    if arch_choice == "128 -> 32 (Default)":
+        hidden_config = [(128, act_enum), (32, act_enum)]
+    elif arch_choice == "128":
+        hidden_config = [(128, act_enum)]
+    elif arch_choice == "256 -> 128":
+        hidden_config = [(256, act_enum), (128, act_enum)]
+    elif arch_choice == "64 -> 32 -> 16":
+        hidden_config = [(64, act_enum), (32, act_enum), (16, act_enum)]
+    else:
+        hidden_config = [(128, act_enum), (32, act_enum)]
+
+    epochs = st.slider("Epochs", min_value=1, max_value=50, value=12, step=1)
+    lr = st.number_input("Learning Rate", min_value=0.001, max_value=5.0, value=0.2, step=0.05, format="%.3f")
+    batch_size = st.select_slider("Batch Size", options=[16, 32, 64, 128, 256], value=32)
+
+    opt_choice = st.selectbox("Optimizer", options=["MINI_BATCH", "SGD", "GD"], index=0)
+    optimizer_enum = Optimizer[opt_choice]
+
+    loss_choice = st.selectbox("Loss Function", options=["LOG_LOSS", "MSE"], index=0)
+    loss_enum = LossFunction[loss_choice]
+
+    data_limit = st.select_slider(
+        "Training Samples (Speed vs Accuracy)",
+        options=[5000, 10000, 20000, 60000],
+        value=20000,
+        help="Use a smaller subset for faster training or 60,000 for full dataset accuracy."
+    )
+
+    col_btn1, col_btn2 = st.columns(2)
+    start_train = col_btn1.button("▶️ Start Training", type="primary", use_container_width=True)
+    reset_btn = col_btn2.button("🔄 Reset Model", use_container_width=True)
+
+    if reset_btn:
+        st.session_state.model = create_default_network(hidden_config)
+        st.session_state.is_trained = False
+        st.session_state.training_history = []
+        st.session_state.test_metrics = None
+        st.success("Model reset to initial random weights.")
+        st.rerun()
+
     st.divider()
-    st.header("🔄 Model Hot-Reload")
-    reload_requested = st.button("Reload LinearNeuralNetwork.py", use_container_width=True)
-    st.info("Live-code in `LinearNeuralNetwork.py` during class and click above or draw to see updates.")
+    st.header("🎨 Canvas & Preprocessing")
+    stroke_width = st.slider("Brush Width", min_value=12, max_value=36, value=22, step=2)
+    preprocess_mode = st.radio(
+        "Preprocessing Method",
+        options=["MNIST Center-of-Mass (Recommended)", "Raw Rescale (Direct 28x28)"],
+        index=0,
+        help="MNIST Center-of-Mass crops, scales to 20x20, and centers by center-of-mass, exactly matching MNIST training data."
+    )
+    selected_mode = "mnist_center" if "Center-of-Mass" in preprocess_mode else "raw_rescale"
+
+    st.divider()
+    if st.session_state.is_trained:
+        st.success("🟢 **Model Status:** Trained")
+    else:
+        st.info("🟡 **Model Status:** Untrained (Random Weights)")
 
 
 # ---------------------------------------------------------
-# Model Loading & Hot-Reloading
+# Training Execution Logic
 # ---------------------------------------------------------
-def get_model(force_reload=False):
-    """Dynamically imports and reloads LinearNeuralNetwork."""
+if start_train:
+    st.info("⏳ Loading MNIST dataset...")
     try:
-        import LinearNeuralNetwork as lnn_module
-        if force_reload or "LinearNeuralNetwork" in sys.modules:
-            lnn_module = importlib.reload(lnn_module)
-        
-        cls = getattr(lnn_module, "LinearNeuralNetwork", None)
-        if cls is None:
-            return None, "Class `LinearNeuralNetwork` not found in `LinearNeuralNetwork.py`."
-        
-        # Instantiate model defensively
-        sig = inspect.signature(cls.__init__)
-        params = [p for p in sig.parameters.values() if p.name != "self"]
-        has_varargs = any(p.kind == inspect.Parameter.VAR_POSITIONAL for p in params)
-        required_params = [
-            p for p in params 
-            if p.default == inspect.Parameter.empty and p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
-        ]
-        
-        if len(required_params) == 0 or has_varargs:
-            model = cls()
-        elif len(required_params) == 3:
-            model = cls(784, 128, 10)
+        x_train, y_train, x_test, y_test = load_dataset()
+
+        if data_limit < len(x_train):
+            indices = np.random.choice(len(x_train), data_limit, replace=False)
+            x_train_sub = x_train[indices]
+            y_train_sub = y_train[indices]
         else:
-            model = cls(*([1] * len(required_params)))
-            
-        return model, None
+            x_train_sub = x_train
+            y_train_sub = y_train
+
+        model = NeuralNetwork(input_size=784, output_size=10, hidden_layers=hidden_config)
+
+        train_container = st.container()
+        with train_container:
+            st.subheader("🏋️ Training in Progress...")
+            progress_bar = st.progress(0.0)
+            status_text = st.empty()
+            chart_placeholder = st.empty()
+
+        history = []
+
+        def training_callback(epoch_idx, total_epochs, loss_val, acc_val):
+            progress = (epoch_idx + 1) / total_epochs
+            progress_bar.progress(progress)
+            status_text.markdown(
+                f"**Epoch `{epoch_idx + 1}/{total_epochs}`** &nbsp;|&nbsp; "
+                f"**Loss:** `{loss_val:.4f}` &nbsp;|&nbsp; "
+                f"**Train Accuracy:** `{acc_val * 100:.2f}%`"
+            )
+            history.append({
+                "Epoch": epoch_idx + 1,
+                "Loss": loss_val,
+                "Accuracy (%)": acc_val * 100,
+            })
+            chart_df = pd.DataFrame(history).set_index("Epoch")
+            chart_placeholder.line_chart(chart_df[["Accuracy (%)", "Loss"]])
+
+        model.train(
+            input=x_train_sub,
+            target=y_train_sub,
+            epochs=epochs,
+            learning_rate=lr,
+            loss_func=loss_enum,
+            optimizer=optimizer_enum,
+            batch_size=batch_size,
+            log=False,
+            callback=training_callback,
+        )
+
+        test_preds = model.forward(x_test)
+        test_loss = float(np.mean(loss_enum.compute(y_test, test_preds)).item())
+        test_acc = float(np.mean(np.argmax(test_preds, axis=1) == np.argmax(y_test, axis=1)))
+
+        st.session_state.model = model
+        st.session_state.is_trained = True
+        st.session_state.training_history = history
+        st.session_state.test_metrics = {"loss": test_loss, "accuracy": test_acc}
+
+        st.success(f"🎉 Training Complete! Test Accuracy: **{test_acc * 100:.2f}%** | Test Loss: **{test_loss:.4f}**")
     except Exception as e:
-        return None, f"Error instantiating `LinearNeuralNetwork`: {e}"
-
-
-model, model_err = get_model(force_reload=reload_requested)
+        st.error(f"Error during training: {e}")
 
 
 # ---------------------------------------------------------
-# Main Layout: 3 Columns
+# Main UI Layout: 3 Columns
 # Col 1: Drawing Canvas (280x280)
 # Col 2: Processed 28x28 View & Matrix Stats
-# Col 3: Neural Network Output & Activation Breakdown
+# Col 3: Neural Network Prediction & Probabilities
 # ---------------------------------------------------------
 col1, col2, col3 = st.columns([1.1, 1.1, 1.3], gap="large")
 
 with col1:
     st.subheader("1. ✍️ Draw Here (280×280)")
-    st.caption("Draw a digit (0–9) using the white brush on the black canvas:")
-    
-    # Render custom HTML5 canvas component
-    canvas_data = digit_canvas(stroke_width=stroke_width, key="digit_canvas_component")
-    st.markdown("💡 *Tip: Center the digit for best MNIST-like representation.*")
+    st.caption("Draw a digit (0–9) using the white brush on the canvas:")
 
-# Extract and process image
+    canvas_data = digit_canvas(stroke_width=stroke_width, key="digit_canvas_component")
+    st.markdown("💡 *Tip: Draw digits normally anywhere on the canvas — auto-centering aligns them to MNIST standard.*")
+
+# Extract and process image from canvas
 has_drawing = False
 img_28 = np.zeros((28, 28), dtype=np.float32)
 
@@ -111,37 +338,32 @@ if canvas_data and isinstance(canvas_data, str) and canvas_data.startswith("data
         header, encoded = canvas_data.split(",", 1)
         image_bytes = base64.b64decode(encoded)
         pil_img = Image.open(io.BytesIO(image_bytes)).convert("L")
-        # Downscale to 28x28
-        pil_28 = pil_img.resize((28, 28), Image.Resampling.BILINEAR)
-        # Normalize to [0.0, 1.0]
-        img_28 = np.array(pil_28, dtype=np.float32) / 255.0
-        if np.any(img_28 > 0.05):
-            has_drawing = True
+
+        # Process with bounding box + center of mass centering
+        img_28, has_drawing = preprocess_mnist_digit(pil_img, mode=selected_mode)
     except Exception as e:
         st.error(f"Image processing error: {e}")
 
 with col2:
     st.subheader("2. 🔬 28×28 Processed View")
-    st.caption("How your Neural Network actually sees the input:")
-    
-    # Display the 28x28 downsampled image crisply
+    st.caption("Centered & scaled grayscale input fed into the neural network:")
+
     st.image(
         img_28,
-        caption="Downscaled 28×28 Input Image (Normalized [0.0, 1.0])" if has_drawing else "Canvas empty (All zeros)",
+        caption="Normalized [0.0, 1.0] 28×28 Input" if has_drawing else "Canvas empty (All zeros)",
         width=280,
         clamp=True,
     )
-    
-    # Metadata badges
+
     nonzero_pixels = int(np.count_nonzero(img_28 > 0.05))
     st.markdown(
         f"**Shape:** `(28, 28)` &nbsp;|&nbsp; "
         f"**Non-zero pixels:** `{nonzero_pixels}/784` &nbsp;|&nbsp; "
         f"**Max:** `{img_28.max():.2f}`"
     )
-    
+
     with st.expander("🔍 Inspect Raw 28×28 Numerical Matrix"):
-        st.write("First 10×10 slice of pixel intensities:")
+        st.write("First 10×10 slice of pixel values:")
         st.dataframe(
             pd.DataFrame(np.round(img_28[:10, :10], 2)),
             use_container_width=True,
@@ -150,121 +372,100 @@ with col2:
 
 with col3:
     st.subheader("3. 🚀 Neural Network Prediction")
-    st.caption("Live feed into `LinearNeuralNetwork.forward(x)`")
-    
-    # Prepare input vector according to selected format
-    if "(1, 784)" in target_shape:
-        x_input = img_28.reshape(1, 784)
-    elif "(784, 1)" in target_shape:
-        x_input = img_28.reshape(784, 1)
-    else:
-        x_input = img_28.copy()
-        
-    st.code(f"x shape passed to model: {x_input.shape}", language="python")
+    st.caption("Live feed through `neural_network/` forward pass")
 
-    if model_err:
-        st.error(model_err)
-    elif model is None:
-        st.warning("⚠️ Model is not available.")
-    else:
-        # Check forward method signature and implementation
-        forward_func = getattr(model, "forward", None)
-        if forward_func is None:
-            st.warning("`LinearNeuralNetwork` does not have a `forward` method.")
+    x_input = img_28.reshape(1, 784)
+    active_model = st.session_state.model
+
+    if not st.session_state.is_trained:
+        st.warning("⚠️ **Model is currently untrained.** Click **'▶️ Start Training'** in the sidebar to train on MNIST.")
+
+    try:
+        # Run forward inference
+        raw_output = active_model.forward(x_input)
+        flat_out = np.squeeze(raw_output)
+
+        # Calibrated Probability Calculation:
+        # Since the network output is sigmoid (in [0, 1]), direct normalization gives true confidence
+        sum_activations = float(np.sum(flat_out))
+        if sum_activations > 1e-6 and np.all(flat_out >= 0):
+            probs = flat_out / sum_activations
         else:
-            forward_sig = inspect.signature(forward_func)
-            params = [p for p in forward_sig.parameters.values() if p.name != "self"]
-            
-            # Execute forward defensively
-            result = None
-            forward_executed = False
-            forward_err = None
-            
-            try:
-                if len(params) == 0:
-                    result = forward_func()
-                    forward_executed = True
-                else:
-                    try:
-                        result = forward_func(x_input)
-                        forward_executed = True
-                    except Exception as e_pass:
-                        if x_input.ndim == 2:
-                            result = forward_func(x_input.T)
-                            forward_executed = True
-                        else:
-                            raise e_pass
-            except Exception as e:
-                forward_err = str(e)
-            
-            # Check if forward was not yet implemented (returns None or Ellipsis)
-            if forward_executed and (result is None or result is Ellipsis):
-                st.info(
-                    "🎓 **Ready for Live Teaching!**\n\n"
-                    "Implement the 4 functions in `LinearNeuralNetwork.py`:\n"
-                    "- `__init__(self, ...)`: Initialize weights ($W$) and biases ($b$)\n"
-                    "- `forward(self, x)`: Compute activations $z = Wx + b$, $a = \\sigma(z)$\n"
-                    "- `backward(self, ...)`: Compute gradients\n"
-                    "- `train(self, ...)`: Update weights\n\n"
-                    "As soon as you return logits or probabilities from `forward(x)`, the predictions will appear below!"
-                )
-            elif forward_err:
-                st.warning(f"⚠️ `forward()` encountered an error during call:\n`{forward_err}`")
-                st.info("Check `LinearNeuralNetwork.forward` signature and implementation.")
-            elif forward_executed and result is not None:
-                output_tensor = result
-                if isinstance(result, tuple) and len(result) > 0:
-                    output_tensor = result[0]
-                elif isinstance(result, dict) and "output" in result:
-                    output_tensor = result["output"]
-                
-                if isinstance(output_tensor, np.ndarray):
-                    flat_out = output_tensor.flatten()
-                    if flat_out.size == 10:
-                        if np.any(flat_out < 0) or not np.isclose(np.sum(flat_out), 1.0, atol=1e-2):
-                            exp_vals = np.exp(flat_out - np.max(flat_out))
-                            probs = exp_vals / np.sum(exp_vals)
-                        else:
-                            probs = flat_out
-                            
-                        predicted_digit = int(np.argmax(probs))
-                        confidence = float(probs[predicted_digit]) * 100
-                        
-                        st.metric(
-                            label="Predicted Digit",
-                            value=f"{predicted_digit}",
-                            delta=f"{confidence:.1f}% confidence",
-                        )
-                        
-                        chart_df = pd.DataFrame({
-                            "Digit": [str(i) for i in range(10)],
-                            "Probability": probs,
-                        })
-                        st.bar_chart(chart_df.set_index("Digit"), y="Probability", height=220)
-                    else:
-                        st.write("Forward output shape:", output_tensor.shape)
-                        st.write("Raw output:", output_tensor)
-                else:
-                    st.write("Forward returned:", output_tensor)
+            exp_vals = np.exp(flat_out - np.max(flat_out))
+            probs = exp_vals / np.sum(exp_vals)
+
+        predicted_digit = int(np.argmax(flat_out))
+        confidence = float(probs[predicted_digit]) * 100
+
+        # Primary Metric Card
+        st.metric(
+            label="Predicted Digit",
+            value=f"{predicted_digit}" if has_drawing else "—",
+            delta=f"{confidence:.1f}% confidence" if has_drawing else "Draw a digit",
+        )
+
+        # Class Probability Bar Chart
+        prob_df = pd.DataFrame({
+            "Digit": [str(i) for i in range(10)],
+            "Probability": probs if has_drawing else np.zeros(10),
+            "Raw Activation": flat_out if has_drawing else np.zeros(10),
+        })
+        st.bar_chart(prob_df.set_index("Digit")["Probability"], height=220)
+
+        if has_drawing:
+            # Top 3 Candidates
+            top3_indices = np.argsort(probs)[::-1][:3]
+            top3_str = " &nbsp;|&nbsp; ".join(
+                [f"**#{rank+1}:** `{idx}` ({probs[idx]*100:.1f}%)" for rank, idx in enumerate(top3_indices)]
+            )
+            st.markdown(f"**Top Candidates:** {top3_str}")
+        else:
+            st.info("Draw a digit on the left canvas to see predictions in real time.")
+
+    except Exception as e:
+        st.error(f"Inference error: {e}")
+
 
 # ---------------------------------------------------------
-# Educational Inspection Section: Weights & Activations
+# Educational Inspection Section: Layer Weights & Activations
 # ---------------------------------------------------------
 st.divider()
-with st.expander("📚 Model Inspection (Weights & Biases in `model`)"):
-    st.markdown("Here students can inspect any attributes defined on `self` in `LinearNeuralNetwork`:")
-    if model is not None:
-        attrs = {
-            k: v for k, v in model.__dict__.items()
-            if not k.startswith("_")
-        }
-        if attrs:
-            for name, val in attrs.items():
-                if isinstance(val, np.ndarray):
-                    st.write(f"- **`self.{name}`**: numpy array with shape `{val.shape}`, dtype `{val.dtype}`")
+col_left, col_right = st.columns(2)
+
+with col_left:
+    with st.expander("📚 Model Architecture & Layer Dimensions", expanded=False):
+        st.markdown(f"**Total Layers:** `{len(active_model.layers)}`")
+        for i, layer in enumerate(active_model.layers):
+            w = active_model.weights[i]
+            b = active_model.biases[i]
+            act_name = layer[2].name
+            st.markdown(
+                f"- **Layer {i+1}:** `({layer[0]} → {layer[1]})` | Activation: `{act_name}` | "
+                f"Weights: `{w.shape}` | Biases: `{b.shape}`"
+            )
+
+with col_right:
+    with st.expander("⚡ Live Layer Activations for Canvas Input", expanded=False):
+        if hasattr(active_model, "posts") and len(active_model.posts) > 0 and has_drawing:
+            for i, post_act in enumerate(active_model.posts):
+                if i == 0:
+                    st.write(f"- **Input $a^{(0)}$:** shape `{post_act.shape}`, mean `{np.mean(post_act):.4f}`")
                 else:
-                    st.write(f"- **`self.{name}`**: `{type(val).__name__}` = `{val}`")
+                    st.write(
+                        f"- **Layer {i} Activation $a^{{({i})}}$:** shape `{post_act.shape}`, "
+                        f"min `{np.min(post_act):.3f}`, max `{np.max(post_act):.3f}`, mean `{np.mean(post_act):.3f}`"
+                    )
         else:
-            st.info("No attributes found on `self` yet. Once you define `self.W` or `self.b` in `__init__`, they will be listed here.")
-    else:
-        st.write("Model not initialized.")
+            st.write("Draw on canvas to trigger activation computation.")
+
+# Training Performance & Test Metrics Expander
+if st.session_state.training_history:
+    with st.expander("📈 Training History & Evaluation Metrics", expanded=False):
+        hist_df = pd.DataFrame(st.session_state.training_history)
+        if st.session_state.test_metrics:
+            tm = st.session_state.test_metrics
+            st.markdown(
+                f"**Final Test Accuracy:** `{tm['accuracy']*100:.2f}%` &nbsp;|&nbsp; "
+                f"**Final Test Loss:** `{tm['loss']:.4f}`"
+            )
+        st.line_chart(hist_df.set_index("Epoch")[["Accuracy (%)", "Loss"]])
