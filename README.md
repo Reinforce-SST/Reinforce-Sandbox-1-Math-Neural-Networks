@@ -21,6 +21,27 @@ pipx ensurepath
 pipx install uv
 ```
 
+To install `python` and `git`:
+
+**Windows**
+```bash
+winget install --id Git.Git -e --source winget;
+winget install Python.Python
+```
+
+**MacOS**
+```bash
+brew install git
+brew install python
+```
+
+**Linux (Ubuntu/Debian)**
+```bash
+sudo apt update
+sudo apt install git -y
+sudo apt install python3 -y
+```
+
 ---
 
 ## 🎨 Features
