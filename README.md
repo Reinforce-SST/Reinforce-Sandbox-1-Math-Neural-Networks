@@ -4,12 +4,17 @@ An interactive Streamlit visualizer for teaching Neural Networks from scratch (e
 
 ## 🚀 Quickstart
 
-Run the Streamlit application using `uv`:
+Clone the repository:
 
 ```bash
 git clone https://github.com/Reinforce-SST/Reinforce-Sandbox-1-Math-Neural-Networks.git
 cd Reinforce-Sandbox-1-Math-Neural-Networks
 uv sync
+```
+
+Run the Streamlit application using `uv`:
+
+```bash
 uv run main.py
 ```
 
@@ -21,7 +26,7 @@ pipx ensurepath
 pipx install uv
 ```
 
-To install `python` and `git`:
+To install `git` and `python`:
 
 **Windows**
 ```bash
