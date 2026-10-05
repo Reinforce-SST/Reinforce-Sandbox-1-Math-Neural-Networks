@@ -1,6 +1,7 @@
 import base64
 import io
 from pathlib import Path
+import struct
 import sys
 import numpy as np
 import pandas as pd
@@ -8,16 +9,9 @@ from PIL import Image
 import streamlit as st
 import streamlit.components.v1 as components
 
-# Ensure neural_network module and its internal dependencies are discoverable
-NEURAL_NET_DIR = Path(__file__).parent / "neural_network"
-if str(NEURAL_NET_DIR) not in sys.path:
-    sys.path.insert(0, str(NEURAL_NET_DIR))
-
-from activation import Activation
-from loss_function import LossFunction
-from optimizer import Optimizer
-from neural_network import NeuralNetwork
-from loader import load_mnist_images, load_mnist_labels
+# Import LinearNeuralNetwork and math helpers
+from LinearNeuralNetwork import LinearNeuralNetwork
+from math_helpers import mse
 
 # ---------------------------------------------------------
 # Page Configuration
@@ -30,8 +24,8 @@ st.set_page_config(
 
 st.title("🧠 Neural Network Sandbox: Live Training & Canvas Inference")
 st.caption(
-    "Interactive deep learning playground connected directly to `neural_network/`. "
-    "Train your custom multi-layer perceptron on MNIST and test predictions live on the drawing canvas."
+    "Interactive deep learning playground powered by `LinearNeuralNetwork.py`. "
+    "Configure hidden layers, train on MNIST, and test predictions live on the drawing canvas."
 )
 
 # Declare HTML5 Canvas Component
@@ -109,29 +103,45 @@ def preprocess_mnist_digit(pil_img, mode="mnist_center"):
 
 
 # ---------------------------------------------------------
-# Cached Dataset Loader
+# IDX Dataset Loader
 # ---------------------------------------------------------
+def load_mnist_images(filename):
+    """Loads MNIST images from a ubyte file and normalizes them to [0, 1]."""
+    with open(filename, "rb") as f:
+        magic, num, rows, cols = struct.unpack(">IIII", f.read(16))
+        buffer = f.read()
+        data = np.frombuffer(buffer, dtype=np.uint8)
+        return data.reshape(num, rows * cols).astype(np.float32) / 255.0
+
+
+def load_mnist_labels(filename):
+    """Loads MNIST labels from a ubyte file."""
+    with open(filename, "rb") as f:
+        magic, num = struct.unpack(">II", f.read(8))
+        buffer = f.read()
+        return np.frombuffer(buffer, dtype=np.uint8)
+
+
 @st.cache_data(show_spinner=False)
 def load_dataset():
-    """Loads MNIST train and test sets from neural_network/dataset."""
-    dataset_dir = NEURAL_NET_DIR / "dataset"
+    """Loads MNIST train and test sets from dataset directory."""
+    dataset_dir = Path(__file__).parent / "dataset"
 
-    # Path resolution supporting both directory nested or flat structures
-    train_img_path = dataset_dir / "train-images-idx3-ubyte" / "train-images-idx3-ubyte"
+    train_img_path = dataset_dir / "train-images.idx3-ubyte"
     if not train_img_path.exists():
-        train_img_path = dataset_dir / "train-images.idx3-ubyte"
+        train_img_path = dataset_dir / "train-images-idx3-ubyte" / "train-images-idx3-ubyte"
 
-    train_lbl_path = dataset_dir / "train-labels-idx1-ubyte" / "train-labels-idx1-ubyte"
+    train_lbl_path = dataset_dir / "train-labels.idx1-ubyte"
     if not train_lbl_path.exists():
-        train_lbl_path = dataset_dir / "train-labels.idx1-ubyte"
+        train_lbl_path = dataset_dir / "train-labels-idx1-ubyte" / "train-labels-idx1-ubyte"
 
-    test_img_path = dataset_dir / "t10k-images-idx3-ubyte" / "t10k-images-idx3-ubyte"
+    test_img_path = dataset_dir / "t10k-images.idx3-ubyte"
     if not test_img_path.exists():
-        test_img_path = dataset_dir / "t10k-images.idx3-ubyte"
+        test_img_path = dataset_dir / "t10k-images-idx3-ubyte" / "t10k-images-idx3-ubyte"
 
-    test_lbl_path = dataset_dir / "t10k-labels-idx1-ubyte" / "t10k-labels-idx1-ubyte"
+    test_lbl_path = dataset_dir / "t10k-labels.idx1-ubyte"
     if not test_lbl_path.exists():
-        test_lbl_path = dataset_dir / "t10k-labels.idx1-ubyte"
+        test_lbl_path = dataset_dir / "t10k-labels-idx1-ubyte" / "t10k-labels-idx1-ubyte"
 
     x_train = load_mnist_images(str(train_img_path))
     y_train_raw = load_mnist_labels(str(train_lbl_path))
@@ -145,87 +155,88 @@ def load_dataset():
 
 
 # ---------------------------------------------------------
-# Session State Initialization
-# ---------------------------------------------------------
-def create_default_network(hidden_layers_spec=None):
-    if hidden_layers_spec is None:
-        hidden_layers_spec = [
-            (128, Activation.SIGMOID),
-            (32, Activation.SIGMOID),
-        ]
-    return NeuralNetwork(input_size=784, output_size=10, hidden_layers=hidden_layers_spec)
-
-
-if "model" not in st.session_state:
-    st.session_state.model = create_default_network()
-    st.session_state.is_trained = False
-    st.session_state.training_history = []
-    st.session_state.test_metrics = None
-
-
-# ---------------------------------------------------------
-# Sidebar: Training Controls & Canvas Settings
+# Sidebar: Model Architecture & Training Controls
 # ---------------------------------------------------------
 with st.sidebar:
-    st.header("⚙️ Model Training")
+    st.header("⚙️ Model Architecture")
 
-    arch_choice = st.selectbox(
-        "Hidden Layers Architecture",
-        options=[
-            "128 -> 32 (Default)",
-            "128",
-            "256 -> 128",
-            "64 -> 32 -> 16",
-        ],
+    # Fixed input and output dimensions for MNIST
+    INPUT_SIZE = 784
+    OUTPUT_SIZE = 10
+
+    col_io1, col_io2 = st.columns(2)
+    with col_io1:
+        st.metric("Input Layer", f"{INPUT_SIZE}", help="Fixed: 28×28 pixels")
+    with col_io2:
+        st.metric("Output Layer", f"{OUTPUT_SIZE}", help="Fixed: 10 digit classes (0–9)")
+
+    # Editable Hidden Layer Architecture
+    hidden_mode = st.radio(
+        "Hidden Layer Setup",
+        options=["Preset Architectures", "Custom Hidden Sizes"],
         index=0,
     )
 
-    act_choice = st.selectbox(
-        "Activation Function",
-        options=["SIGMOID", "RELU", "TANH", "LINEAR"],
-        index=0,
-    )
-    act_enum = Activation[act_choice]
-
-    if arch_choice == "128 -> 32 (Default)":
-        hidden_config = [(128, act_enum), (32, act_enum)]
-    elif arch_choice == "128":
-        hidden_config = [(128, act_enum)]
-    elif arch_choice == "256 -> 128":
-        hidden_config = [(256, act_enum), (128, act_enum)]
-    elif arch_choice == "64 -> 32 -> 16":
-        hidden_config = [(64, act_enum), (32, act_enum), (16, act_enum)]
+    if hidden_mode == "Preset Architectures":
+        arch_choice = st.selectbox(
+            "Select Preset",
+            options=[
+                "128 -> 32 (Default)",
+                "128",
+                "256 -> 128",
+                "64 -> 32 -> 16",
+                "64",
+            ],
+            index=0,
+        )
+        if arch_choice == "128 -> 32 (Default)":
+            hidden_layers = [128, 32]
+        elif arch_choice == "128":
+            hidden_layers = [128]
+        elif arch_choice == "256 -> 128":
+            hidden_layers = [256, 128]
+        elif arch_choice == "64 -> 32 -> 16":
+            hidden_layers = [64, 32, 16]
+        elif arch_choice == "64":
+            hidden_layers = [64]
+        else:
+            hidden_layers = [128, 32]
     else:
-        hidden_config = [(128, act_enum), (32, act_enum)]
+        custom_str = st.text_input(
+            "Custom Hidden Layers",
+            value="128, 32",
+            help="Comma-separated integers for hidden layer sizes, e.g., '128, 32' or '64' or '256, 128, 64'",
+        )
+        try:
+            hidden_layers = [int(s.strip()) for s in custom_str.split(",") if s.strip()]
+            if not hidden_layers or any(x <= 0 for x in hidden_layers):
+                st.error("Invalid layer configuration. Falling back to [128, 32].")
+                hidden_layers = [128, 32]
+        except ValueError:
+            st.error("Please enter valid comma-separated integers. Falling back to [128, 32].")
+            hidden_layers = [128, 32]
 
-    epochs = st.slider("Epochs", min_value=1, max_value=50, value=12, step=1)
-    lr = st.number_input("Learning Rate", min_value=0.001, max_value=5.0, value=0.2, step=0.05, format="%.3f")
-    batch_size = st.select_slider("Batch Size", options=[16, 32, 64, 128, 256], value=32)
+    # Full network layer sizes: [Input, ...Hidden, Output]
+    current_layer_sizes = [INPUT_SIZE] + hidden_layers + [OUTPUT_SIZE]
+    arch_display = " ➔ ".join([str(sz) for sz in current_layer_sizes])
+    st.info(f"📐 **Architecture:** `{arch_display}`")
 
-    opt_choice = st.selectbox("Optimizer", options=["MINI_BATCH", "SGD", "GD"], index=0)
-    optimizer_enum = Optimizer[opt_choice]
+    st.divider()
+    st.header("🏋️ Hyperparameters")
 
-    loss_choice = st.selectbox("Loss Function", options=["LOG_LOSS", "MSE"], index=0)
-    loss_enum = LossFunction[loss_choice]
+    epochs = int(st.number_input("Epochs", min_value=1, max_value=5000, value=20, step=1))
+    lr = st.number_input("Learning Rate", min_value=0.001, max_value=10.0, value=1.0, step=0.1, format="%.3f")
 
     data_limit = st.select_slider(
         "Training Samples (Speed vs Accuracy)",
-        options=[5000, 10000, 20000, 60000],
-        value=20000,
-        help="Use a smaller subset for faster training or 60,000 for full dataset accuracy."
+        options=[500, 1000, 2000, 5000, 10000],
+        value=1000,
+        help="Use a smaller subset for instant training during lectures or more samples for higher accuracy.",
     )
 
     col_btn1, col_btn2 = st.columns(2)
     start_train = col_btn1.button("▶️ Start Training", type="primary", use_container_width=True)
     reset_btn = col_btn2.button("🔄 Reset Model", use_container_width=True)
-
-    if reset_btn:
-        st.session_state.model = create_default_network(hidden_config)
-        st.session_state.is_trained = False
-        st.session_state.training_history = []
-        st.session_state.test_metrics = None
-        st.success("Model reset to initial random weights.")
-        st.rerun()
 
     st.divider()
     st.header("🎨 Canvas & Preprocessing")
@@ -234,19 +245,45 @@ with st.sidebar:
         "Preprocessing Method",
         options=["MNIST Center-of-Mass (Recommended)", "Raw Rescale (Direct 28x28)"],
         index=0,
-        help="MNIST Center-of-Mass crops, scales to 20x20, and centers by center-of-mass, exactly matching MNIST training data."
+        help="MNIST Center-of-Mass crops, scales to 20x20, and centers by center-of-mass, exactly matching MNIST training data.",
     )
     selected_mode = "mnist_center" if "Center-of-Mass" in preprocess_mode else "raw_rescale"
 
     st.divider()
-    if st.session_state.is_trained:
+    # Model status display
+    if "is_trained" in st.session_state and st.session_state.is_trained:
         st.success("🟢 **Model Status:** Trained")
     else:
         st.info("🟡 **Model Status:** Untrained (Random Weights)")
 
 
 # ---------------------------------------------------------
-# Training Execution Logic
+# Session State Initialization
+# ---------------------------------------------------------
+if (
+    "model" not in st.session_state
+    or st.session_state.get("current_layer_sizes") != current_layer_sizes
+):
+    st.session_state.model = LinearNeuralNetwork(current_layer_sizes)
+    st.session_state.current_layer_sizes = current_layer_sizes
+    st.session_state.is_trained = False
+    st.session_state.training_history = []
+    st.session_state.test_metrics = None
+    st.session_state.last_training_summary = None
+
+if reset_btn:
+    st.session_state.model = LinearNeuralNetwork(current_layer_sizes)
+    st.session_state.current_layer_sizes = current_layer_sizes
+    st.session_state.is_trained = False
+    st.session_state.training_history = []
+    st.session_state.test_metrics = None
+    st.session_state.last_training_summary = None
+    st.success("Model reset with newly initialized weights.")
+    st.rerun()
+
+
+# ---------------------------------------------------------
+# Training Dashboard Section (Persistent On Screen)
 # ---------------------------------------------------------
 if start_train:
     st.info("⏳ Loading MNIST dataset...")
@@ -261,57 +298,96 @@ if start_train:
             x_train_sub = x_train
             y_train_sub = y_train
 
-        model = NeuralNetwork(input_size=784, output_size=10, hidden_layers=hidden_config)
+        model = LinearNeuralNetwork(current_layer_sizes)
 
         train_container = st.container()
         with train_container:
             st.subheader("🏋️ Training in Progress...")
             progress_bar = st.progress(0.0)
             status_text = st.empty()
-            chart_placeholder = st.empty()
+
+            col_chart1, col_chart2 = st.columns(2)
+            with col_chart1:
+                st.markdown("**📉 Loss Curve (Training)**")
+                loss_placeholder = st.empty()
+            with col_chart2:
+                st.markdown("**📈 Accuracy Curve (%)**")
+                acc_placeholder = st.empty()
 
         history = []
 
-        def training_callback(epoch_idx, total_epochs, loss_val, acc_val):
-            progress = (epoch_idx + 1) / total_epochs
+        for epoch in range(epochs):
+            # Pure full-batch Gradient Descent
+            posts = model.forward(x_train_sub)
+            model.backward(y_train_sub, posts, lr=lr)
+
+            # Evaluate training metrics after epoch
+            train_preds = posts[-1]
+            loss_val = float(mse(y_train_sub, train_preds))
+            acc_val = float(np.mean(np.argmax(train_preds, axis=1) == np.argmax(y_train_sub, axis=1)))
+
+            progress = (epoch + 1) / epochs
             progress_bar.progress(progress)
             status_text.markdown(
-                f"**Epoch `{epoch_idx + 1}/{total_epochs}`** &nbsp;|&nbsp; "
+                f"**Epoch `{epoch + 1}/{epochs}`** &nbsp;|&nbsp; "
                 f"**Loss:** `{loss_val:.4f}` &nbsp;|&nbsp; "
                 f"**Train Accuracy:** `{acc_val * 100:.2f}%`"
             )
             history.append({
-                "Epoch": epoch_idx + 1,
+                "Epoch": epoch + 1,
                 "Loss": loss_val,
                 "Accuracy (%)": acc_val * 100,
             })
             chart_df = pd.DataFrame(history).set_index("Epoch")
-            chart_placeholder.line_chart(chart_df[["Accuracy (%)", "Loss"]])
+            loss_placeholder.line_chart(chart_df["Loss"])
+            acc_placeholder.line_chart(chart_df["Accuracy (%)"])
 
-        model.train(
-            input=x_train_sub,
-            target=y_train_sub,
-            epochs=epochs,
-            learning_rate=lr,
-            loss_func=loss_enum,
-            optimizer=optimizer_enum,
-            batch_size=batch_size,
-            log=False,
-            callback=training_callback,
-        )
+        # Evaluate on test set (or subset for speed)
+        test_sub_size = min(2000, len(x_test))
+        test_posts = model.forward(x_test[:test_sub_size])
+        test_preds = test_posts[-1]
+        test_loss = float(mse(y_test[:test_sub_size], test_preds))
+        test_acc = float(np.mean(np.argmax(test_preds, axis=1) == np.argmax(y_test[:test_sub_size], axis=1)))
 
-        test_preds = model.forward(x_test)
-        test_loss = float(np.mean(loss_enum.compute(y_test, test_preds)).item())
-        test_acc = float(np.mean(np.argmax(test_preds, axis=1) == np.argmax(y_test, axis=1)))
+        summary_msg = f"🎉 Training Complete! Tested on {test_sub_size} samples ➔ Accuracy: {test_acc * 100:.2f}% | Loss: {test_loss:.4f}"
 
         st.session_state.model = model
         st.session_state.is_trained = True
         st.session_state.training_history = history
         st.session_state.test_metrics = {"loss": test_loss, "accuracy": test_acc}
+        st.session_state.last_training_summary = summary_msg
 
-        st.success(f"🎉 Training Complete! Test Accuracy: **{test_acc * 100:.2f}%** | Test Loss: **{test_loss:.4f}**")
+        st.success(summary_msg)
     except Exception as e:
         st.error(f"Error during training: {e}")
+
+elif st.session_state.training_history:
+    # Persistently display training results & curves on screen after training is done
+    st.subheader("🏋️ Training Performance & History")
+    if st.session_state.last_training_summary:
+        st.success(st.session_state.last_training_summary)
+
+    hist_df = pd.DataFrame(st.session_state.training_history).set_index("Epoch")
+    final_loss = float(hist_df["Loss"].iloc[-1])
+    final_acc = float(hist_df["Accuracy (%)"].iloc[-1])
+    tm = st.session_state.test_metrics
+
+    col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+    col_m1.metric("Final Train Loss", f"{final_loss:.4f}")
+    col_m2.metric("Final Train Accuracy", f"{final_acc:.2f}%")
+    if tm:
+        col_m3.metric("Test Accuracy", f"{tm['accuracy']*100:.2f}%")
+        col_m4.metric("Test Loss", f"{tm['loss']:.4f}")
+
+    col_c1, col_c2 = st.columns(2)
+    with col_c1:
+        st.markdown("**📉 Loss Curve (Training)**")
+        st.line_chart(hist_df["Loss"], height=230)
+    with col_c2:
+        st.markdown("**📈 Accuracy Curve (%)**")
+        st.line_chart(hist_df["Accuracy (%)"], height=230)
+
+    st.divider()
 
 
 # ---------------------------------------------------------
@@ -339,7 +415,6 @@ if canvas_data and isinstance(canvas_data, str) and canvas_data.startswith("data
         image_bytes = base64.b64decode(encoded)
         pil_img = Image.open(io.BytesIO(image_bytes)).convert("L")
 
-        # Process with bounding box + center of mass centering
         img_28, has_drawing = preprocess_mnist_digit(pil_img, mode=selected_mode)
     except Exception as e:
         st.error(f"Image processing error: {e}")
@@ -372,7 +447,7 @@ with col2:
 
 with col3:
     st.subheader("3. 🚀 Neural Network Prediction")
-    st.caption("Live feed through `neural_network/` forward pass")
+    st.caption("Live feed through `LinearNeuralNetwork` forward pass")
 
     x_input = img_28.reshape(1, 784)
     active_model = st.session_state.model
@@ -381,12 +456,12 @@ with col3:
         st.warning("⚠️ **Model is currently untrained.** Click **'▶️ Start Training'** in the sidebar to train on MNIST.")
 
     try:
-        # Run forward inference
-        raw_output = active_model.forward(x_input)
+        # Run forward inference through LinearNeuralNetwork
+        post_activations = active_model.forward(x_input)
+        raw_output = post_activations[-1]
         flat_out = np.squeeze(raw_output)
 
         # Calibrated Probability Calculation:
-        # Since the network output is sigmoid (in [0, 1]), direct normalization gives true confidence
         sum_activations = float(np.sum(flat_out))
         if sum_activations > 1e-6 and np.all(flat_out >= 0):
             probs = flat_out / sum_activations
@@ -434,38 +509,34 @@ col_left, col_right = st.columns(2)
 
 with col_left:
     with st.expander("📚 Model Architecture & Layer Dimensions", expanded=False):
-        st.markdown(f"**Total Layers:** `{len(active_model.layers)}`")
-        for i, layer in enumerate(active_model.layers):
+        num_layers = active_model.num_layers
+        st.markdown(f"**Total Weight Layers:** `{num_layers}`")
+        for i in range(num_layers):
             w = active_model.weights[i]
             b = active_model.biases[i]
-            act_name = layer[2].name
+            in_dim = w.shape[0]
+            out_dim = w.shape[1]
             st.markdown(
-                f"- **Layer {i+1}:** `({layer[0]} → {layer[1]})` | Activation: `{act_name}` | "
+                f"- **Layer {i+1}:** `({in_dim} → {out_dim})` | "
                 f"Weights: `{w.shape}` | Biases: `{b.shape}`"
             )
 
 with col_right:
     with st.expander("⚡ Live Layer Activations for Canvas Input", expanded=False):
-        if hasattr(active_model, "posts") and len(active_model.posts) > 0 and has_drawing:
-            for i, post_act in enumerate(active_model.posts):
-                if i == 0:
-                    st.write(f"- **Input $a^{(0)}$:** shape `{post_act.shape}`, mean `{np.mean(post_act):.4f}`")
-                else:
-                    st.write(
-                        f"- **Layer {i} Activation $a^{{({i})}}$:** shape `{post_act.shape}`, "
-                        f"min `{np.min(post_act):.3f}`, max `{np.max(post_act):.3f}`, mean `{np.mean(post_act):.3f}`"
-                    )
+        if has_drawing:
+            try:
+                live_posts = active_model.forward(x_input)
+                for i, post_act in enumerate(live_posts):
+                    if i == 0:
+                        st.write(f"- **Input $a^{(0)}$:** shape `{post_act.shape}`, mean `{np.mean(post_act):.4f}`")
+                    else:
+                        st.write(
+                            f"- **Layer {i} Activation $a^{{({i})}}$:** shape `{post_act.shape}`, "
+                            f"min `{np.min(post_act):.3f}`, max `{np.max(post_act):.3f}`, mean `{np.mean(post_act):.3f}`"
+                        )
+            except Exception as e:
+                st.write(f"Error computing activations: {e}")
         else:
             st.write("Draw on canvas to trigger activation computation.")
 
-# Training Performance & Test Metrics Expander
-if st.session_state.training_history:
-    with st.expander("📈 Training History & Evaluation Metrics", expanded=False):
-        hist_df = pd.DataFrame(st.session_state.training_history)
-        if st.session_state.test_metrics:
-            tm = st.session_state.test_metrics
-            st.markdown(
-                f"**Final Test Accuracy:** `{tm['accuracy']*100:.2f}%` &nbsp;|&nbsp; "
-                f"**Final Test Loss:** `{tm['loss']:.4f}`"
-            )
-        st.line_chart(hist_df.set_index("Epoch")[["Accuracy (%)", "Loss"]])
+

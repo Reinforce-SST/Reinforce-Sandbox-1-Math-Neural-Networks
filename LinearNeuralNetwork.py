@@ -34,7 +34,8 @@ class LinearNeuralNetwork:
         return post_activations
 
     def backward(self, y_true, post_activations, lr = 0.5):
-        error = mse_derivative(y_true, post_activations[-1],)
+        n = y_true.shape[0] if y_true.ndim > 0 else 1
+        error = mse_derivative(y_true, post_activations[-1]) /n
         current_activation_derivative = error * sigmoid_derivative_A(post_activations[-1])
         
         for layer in reversed(range(self.num_layers)):
@@ -46,7 +47,11 @@ class LinearNeuralNetwork:
 
             if layer > 0:
                 dz_da_prev = current_activation_derivative @ weights.T
-                current_activation_derivative = dz_da_prev * sigmoid_derivative_A(post_activations[layer])
+                if layer == 1:
+                    # Layer 0 was linear, so derivative of linear activation is 1
+                    current_activation_derivative = dz_da_prev
+                else:
+                    current_activation_derivative = dz_da_prev * sigmoid_derivative_A(post_activations[layer])
 
             self.weights[layer] -= lr * dz_dw
             self.biases[layer] -= lr * dz_db
