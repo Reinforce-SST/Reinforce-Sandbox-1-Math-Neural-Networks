@@ -31,7 +31,7 @@ To install `git` and `python`:
 **Windows**
 ```bash
 winget install --id Git.Git -e --source winget;
-winget install Python.Python
+winget install --id Python.Python.3 -e --source winget
 ```
 
 **MacOS**
@@ -45,6 +45,7 @@ brew install python
 sudo apt update
 sudo apt install git -y
 sudo apt install python3 -y
+sudo apt install python3-pip -y
 ```
 
 ---
